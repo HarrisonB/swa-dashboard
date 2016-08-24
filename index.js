@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 "use strict"
 
+const assert = require("assert")
+const fs = require("fs")
 const osmosis = require("osmosis")
 const chalk = require("chalk")
 const rainbow = require("chalk-rainbow")
@@ -10,6 +12,7 @@ const contrib = require("blessed-contrib")
 const format = require("date-format")
 const pretty = require("pretty-ms")
 const airports = require("airports")
+const jsonfile = require("jsonfile")
 
 // Time constants
 const TIME_MS = 1
@@ -25,41 +28,62 @@ const fares = {
   return: []
 }
 
-// Command line options
-var originAirport
-var destinationAirport
-var outboundDateString
-var returnDateString
-var adultPassengerCount
 var dealPriceThreshold
-var interval = 30 // In minutes
+
+var saveFile = ""
+var dataSave = {
+	originAirport: undefined,
+	destinationAirport: undefined,
+	outboundDateString: undefined,
+	returnDateString: undefined,
+	adultPassengerCount: 1,
+	dealPriceThreshold: undefined,
+	interval: 30,
+	lowestFares: [] 
+}
+
 
 // Parse command line options (no validation, sorry!)
 process.argv.forEach((arg, i, argv) => {
   switch (arg) {
     case "--from":
-      originAirport = argv[i + 1]
+      dataSave.originAirport = argv[i + 1]
       break
     case "--to":
-      destinationAirport = argv[i + 1]
+      dataSave.destinationAirport = argv[i + 1]
       break
     case "--leave-date":
-      outboundDateString = argv[i + 1]
+      dataSave.outboundDateString = argv[i + 1]
       break
     case "--return-date":
-      returnDateString = argv[i + 1]
+      dataSave.returnDateString = argv[i + 1]
       break
     case "--passengers":
-      adultPassengerCount = argv[i + 1]
+      dataSave.adultPassengerCount = argv[i + 1]
       break
     case "--deal-price-threshold":
-      dealPriceThreshold = parseInt(argv[i + 1])
+      dataSave.dealPriceThreshold = parseInt(argv[i + 1])
       break
     case "--interval":
-      interval = parseFloat(argv[i + 1])
+      dataSave.interval = parseFloat(argv[i + 1])
+      break
+    case "--save-log":
+      saveFile = argv[i + 1]
       break
   }
 })
+
+// Load up data from saveFile if it exists
+
+if (saveFile !== "") {
+	assert(saveFile.slice(-5).toLowerCase() === '.json', `Log file ${saveFile} must end in '.json'`)
+	try {
+		dataSave = JSON.parse(fs.readFileSync(saveFile))
+	} catch (e) {
+		// If file doesn't exist then fail silently as it means we're creating a
+		// new file
+	}
+}
 
 // Check if Twilio env vars are set
 const isTwilioConfigured = process.env.TWILIO_ACCOUNT_SID &&
@@ -219,6 +243,15 @@ class Dashboard {
   }
 
   /**
+   * Return datetime stamp for current time
+   *
+   * @return {Void}
+   */
+  static now() {
+    return format("MM/dd/yy-hh:mm:ss", new Date())
+  }
+
+  /**
    * Plot graph data
    *
    * @param {Arr} prices
@@ -226,7 +259,7 @@ class Dashboard {
    * @return {Void}
    */
   plot(prices) {
-    const now = format("MM/dd/yy-hh:mm:ss", new Date())
+    const now = Dashboard.now()
 
     Object.assign(this.graphs.outbound, {
       x: [...this.graphs.outbound.x, now],
@@ -278,12 +311,15 @@ class Dashboard {
    * Log data
    *
    * @param {Arr} messages
+   * @param {Str} [datetime=Dashboard.now()]
    *
    * @return {Void}
    */
-  log(messages) {
-    const now = format("MM/dd/yy-hh:mm:ss", new Date())
-    messages.forEach((m) => this.widgets.log.log(`${now}: ${m}`))
+  log(messages, datetime) {
+    if (datetime === undefined) {
+      datetime = Dashboard.now()
+    }
+    messages.forEach((m) => this.widgets.log.log(`${datetime}: ${m}`))
   }
 
   /**
@@ -330,6 +366,26 @@ const sendTextMessage = (message) => {
   } catch(e) {}
 }
 
+// Load logged data in display
+dataSave.lowestFares.forEach((record) => {
+  if (record.isDeal) {
+    const message = `Deal alert! Lowest fair has hit \$${lowestOutboundFare} (outbound) and \$${lowestReturnFare} (return)`
+
+    // Party time
+    dashboard.log([
+      rainbow(message)
+    ])
+  }
+  dashboard.log([
+    `Lowest fair for an outbound flight is currently \$${[record.lowestOutboundFare, record.outboundFareDiffString].filter(i => i).join(" ")}`,
+    `Lowest fair for a return flight is currently \$${[record.lowestReturnFare, record.returnFareDiffString].filter(i => i).join(" ")}`
+  ], record.datetime)
+  dashboard.plot({
+    outbound: record.lowestOutboundFare,
+    return: record.lowestReturnFare
+  })
+})
+
 /**
  * Fetch latest Southwest prices
  *
@@ -346,11 +402,11 @@ const fetch = () => {
       returnTimeOfDay: "ANYTIME",
       seniorPassengerCount: 0,
       fareType: "DOLLARS",
-      originAirport,
-      destinationAirport,
-      outboundDateString,
-      returnDateString,
-      adultPassengerCount
+      originAirport: dataSave.originAirport,
+      destinationAirport: dataSave.destinationAirport,
+      outboundDateString: dataSave.outboundDateString,
+      returnDateString: dataSave.returnDateString,
+      adultPassengerCount: dataSave.adultPassengerCount
     })
     .find("#faresOutbound .product_price")
     .then((priceMarkup) => {
@@ -368,6 +424,7 @@ const fetch = () => {
       const lowestOutboundFare = Math.min(...fares.outbound)
       const lowestReturnFare = Math.min(...fares.return)
       var faresAreValid = true
+
 
       // Clear previous fares
       fares.outbound = []
@@ -411,7 +468,8 @@ const fetch = () => {
         prevLowestReturnFare = lowestReturnFare
 
         // Do some Twilio magic (SMS alerts for awesome deals)
-        if (dealPriceThreshold && (lowestOutboundFare <= dealPriceThreshold || lowestReturnFare <= dealPriceThreshold)) {
+        var isDeal = Boolean(dealPriceThreshold && (lowestOutboundFare <= dealPriceThreshold || lowestReturnFare <= dealPriceThreshold))
+        if (isDeal) {
           const message = `Deal alert! Lowest fair has hit \$${lowestOutboundFare} (outbound) and \$${lowestReturnFare} (return)`
 
           // Party time
@@ -429,6 +487,16 @@ const fetch = () => {
           `Lowest fair for a return flight is currently \$${[lowestReturnFare, returnFareDiffString].filter(i => i).join(" ")}`
         ])
 
+        // Store this for saveFile
+        dataSave.lowestFares.push({
+          lowestOutboundFare: lowestOutboundFare,
+          outboundFareDiffString: outboundFareDiffString,
+          lowestReturnFare: lowestReturnFare,
+          returnFareDiffString: returnFareDiffString,
+          datetime: Dashboard.now(),
+          isDeal: isDeal
+        })
+
         dashboard.plot({
           outbound: lowestOutboundFare,
           return: lowestReturnFare
@@ -437,17 +505,25 @@ const fetch = () => {
 
       dashboard.render()
 
-      setTimeout(fetch, interval * TIME_MIN)
+      
+      // Store the data as JSON and complain if there are any issues
+      if (saveFile !== "") {
+        jsonfile.writeFile(saveFile, dataSave, (err) => {
+          console.error(err)
+        })
+      } 
+        setTimeout(fetch, dataSave.interval * TIME_MIN)
     })
 }
+
 
 // Get lat/lon for airports (no validation on non-existent airports)
 airports.forEach((airport) => {
   switch (airport.iata) {
-    case originAirport:
+    case dataSave.originAirport:
       dashboard.waypoint({ lat: airport.lat, lon: airport.lon, color: "red", char: "X" })
       break
-    case destinationAirport:
+    case dataSave.destinationAirport:
       dashboard.waypoint({ lat: airport.lat, lon: airport.lon, color: "yellow", char: "X" })
       break
   }
@@ -455,13 +531,13 @@ airports.forEach((airport) => {
 
 // Print settings
 dashboard.settings([
-  `Origin airport: ${originAirport}`,
-  `Destination airport: ${destinationAirport}`,
-  `Outbound date: ${outboundDateString}`,
-  `Return date: ${returnDateString}`,
-  `Passengers: ${adultPassengerCount}`,
-  `Interval: ${pretty(interval * TIME_MIN)}`,
-  `Deal price: ${dealPriceThreshold ? `<= \$${dealPriceThreshold}` : "disabled"}`,
+  `Origin airport: ${dataSave.originAirport}`,
+  `Destination airport: ${dataSave.destinationAirport}`,
+  `Outbound date: ${dataSave.outboundDateString}`,
+  `Return date: ${dataSave.returnDateString}`,
+  `Passengers: ${dataSave.adultPassengerCount}`,
+  `Interval: ${pretty(dataSave.interval * TIME_MIN)}`,
+  `Deal price: ${dealPriceThreshold ? `<= \$${dataSave.dealPriceThreshold}` : "disabled"}`,
   `SMS alerts: ${isTwilioConfigured ? process.env.TWILIO_PHONE_TO : "disabled"}`
 ])
 
